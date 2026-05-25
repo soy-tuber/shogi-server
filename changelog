@@ -18,6 +18,18 @@
 	  held, deadlocking the whole server. Closing the socket unblocks
 	  the run loop's select/gets_safe; the loop reacquires $mutex,
 	  observes @status == "finished", and exits cleanly.
+	* [shogi-server] Add --manifest-file and --manifest-interval options.
+	  When --manifest-file is given, a writer thread periodically (every
+	  --manifest-interval seconds, default 3) writes a JSON snapshot of
+	  $league.games to that path. Intended to be served by nginx behind
+	  a CDN so spectators can discover in-progress games without
+	  connecting to the CSA server, replacing the deleted webserver
+	  script's role.
+	* [manifest_writer] New class. Holds $mutex only long enough to copy
+	  primitive attributes out of $league.games; JSON serialization and
+	  the file write happen outside the lock. The file is replaced
+	  atomically via rename, so a reader (nginx) never sees a partial
+	  file. Stops via a @stopped flag rather than Thread::kill.
 
 2026-04-18  Daigo Moriwaki <101983+daigo@users.noreply.github.com>
 
