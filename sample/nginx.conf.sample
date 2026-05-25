@@ -1,0 +1,156 @@
+# Sample nginx configuration for the shogi-server VPS (engine-only deployment).
+#
+# This origin serves three small static-ish artifacts that the CDN-side
+# spectator UI fetches:
+#
+#   /manifest.json   — list of currently active games. Refreshed every
+#                      few seconds by the shogi-server process itself
+#                      (--manifest-file option). Cache 3s, SWR 10s.
+#
+#   /ranking.json    — rating ranking, refreshed hourly by cron running
+#                      ./mk_ranking_json. Cache 5min, SWR 1h.
+#
+#   /csa/YYYY/MM/DD/<game_id>.csa
+#                    — CSA game records, written by shogi-server. Active
+#                      games are appended to in real time; finished games
+#                      are immutable. We use a short cache and rely on
+#                      Cloudflare's ETag/Last-Modified handling to absorb
+#                      repeated viewer polling.
+#
+# Cloudflare sits in front of this origin as an orange-cloud proxy.
+# Cache-Control values below are the contract between origin and CDN.
+#
+# The CSA TCP game port (4081 by default) is NOT proxied. Engines connect
+# to a DNS-only (gray-cloud) record pointing directly at the VPS IP.
+#
+# Paths in this file assume:
+#   /var/lib/shogi-server/        — shogi-server working dir (CSA records,
+#                                   logs, players.yaml). NOT directly served.
+#   /var/www/floodgate/           — public-served dir. Symlinks to
+#                                   shogi-server's manifest.json and the
+#                                   cron-generated ranking.json.
+#   /var/www/floodgate/csa/       — symlink or bind-mount of
+#                                   /var/lib/shogi-server (CSA tree only).
+
+# ----------------------------------------------------------------------
+# Real client IP behind Cloudflare. Keep this list in sync with
+# https://www.cloudflare.com/ips/  (or fetch dynamically via cron).
+# ----------------------------------------------------------------------
+set_real_ip_from   173.245.48.0/20;
+set_real_ip_from   103.21.244.0/22;
+set_real_ip_from   103.22.200.0/22;
+set_real_ip_from   103.31.4.0/22;
+set_real_ip_from   141.101.64.0/18;
+set_real_ip_from   108.162.192.0/18;
+set_real_ip_from   190.93.240.0/20;
+set_real_ip_from   188.114.96.0/20;
+set_real_ip_from   197.234.240.0/22;
+set_real_ip_from   198.41.128.0/17;
+set_real_ip_from   162.158.0.0/15;
+set_real_ip_from   104.16.0.0/13;
+set_real_ip_from   104.24.0.0/14;
+set_real_ip_from   172.64.0.0/13;
+set_real_ip_from   131.0.72.0/22;
+set_real_ip_from   2400:cb00::/32;
+set_real_ip_from   2606:4700::/32;
+set_real_ip_from   2803:f800::/32;
+set_real_ip_from   2405:b500::/32;
+set_real_ip_from   2405:8100::/32;
+set_real_ip_from   2a06:98c0::/29;
+set_real_ip_from   2c0f:f248::/32;
+real_ip_header     CF-Connecting-IP;
+
+# ----------------------------------------------------------------------
+# HTTP -> HTTPS redirect.
+# ----------------------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name floodgate.example.jp;
+    return 301 https://$host$request_uri;
+}
+
+# ----------------------------------------------------------------------
+# Main HTTPS server.
+# ----------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name floodgate.example.jp;
+
+    # Cloudflare Origin Certificate. Generate from the Cloudflare dashboard
+    # (SSL/TLS → Origin Server → Create Certificate) — 15-year cert, free.
+    ssl_certificate     /etc/ssl/cloudflare/origin.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/origin.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Public document root. Contains only safe-to-serve files.
+    root /var/www/floodgate;
+
+    # gzip JSON and CSA. CSA files are plain text and compress ~10x.
+    gzip on;
+    gzip_types application/json text/plain;
+    gzip_min_length 256;
+
+    access_log /var/log/nginx/floodgate.access.log;
+    error_log  /var/log/nginx/floodgate.error.log;
+
+    # ------------------------------------------------------------------
+    # /manifest.json — active games. Updated every few seconds.
+    # ------------------------------------------------------------------
+    location = /manifest.json {
+        default_type application/json;
+        add_header Cache-Control "public, max-age=3, stale-while-revalidate=10" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        try_files /manifest.json =404;
+    }
+
+    # ------------------------------------------------------------------
+    # /ranking.json — rating ranking. Updated hourly by cron.
+    # ------------------------------------------------------------------
+    location = /ranking.json {
+        default_type application/json;
+        add_header Cache-Control "public, max-age=300, stale-while-revalidate=3600" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        try_files /ranking.json =404;
+    }
+
+    # ------------------------------------------------------------------
+    # /csa/YYYY/MM/DD/<game_id>.csa — game records.
+    #
+    # Path pattern enforced via regex so attackers can't browse the
+    # parent dirs. Directory autoindex is off (default), so listings
+    # are not exposed.
+    # ------------------------------------------------------------------
+    location ~ ^/csa/\d{4}/\d{2}/\d{2}/[^/]+\.csa$ {
+        default_type text/plain;
+        # No charset is declared — CSA comments may contain EUC-JP per the
+        # CSA spec, and pure-engine games are ASCII. Let the client detect.
+        add_header Cache-Control "public, max-age=5, stale-while-revalidate=60" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        # If the file does not exist, return 404 (no fallback).
+        try_files $uri =404;
+    }
+
+    # ------------------------------------------------------------------
+    # Everything else is forbidden. Explicit deny lists overlap and are
+    # intentional — defense in depth.
+    # ------------------------------------------------------------------
+
+    # Block dotfiles (.git, .htaccess, etc.)
+    location ~ /\. { deny all; }
+
+    # Block sensitive extensions that must never be exposed:
+    #   .yaml — players.yaml (contains MD5 password hashes)
+    #   .conf — floodgate schedule configs
+    #   .log  — server logs
+    #   .pid  — process id file
+    location ~ \.(yaml|conf|log|pid)$ { deny all; }
+
+    # Default: 404 for anything not matched above.
+    location / {
+        return 404;
+    }
+}

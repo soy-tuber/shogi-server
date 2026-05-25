@@ -30,6 +30,16 @@
 	  the file write happen outside the lock. The file is replaced
 	  atomically via rename, so a reader (nginx) never sees a partial
 	  file. Stops via a @stopped flag rather than Thread::kill.
+	* [mk_ranking_json] New top-level script. Reads players.yaml and
+	  emits a JSON ranking sorted by rate descending. Intended to run
+	  hourly via cron and be served as a static file from nginx, so the
+	  spectator UI can render the ranking without hitting the CSA
+	  server. Replaces the ranking output that the deleted mk_html used
+	  to produce.
+	* [sample/nginx.conf.sample] New file. Documents the nginx config
+	  for serving manifest.json, ranking.json, and CSA records behind
+	  Cloudflare, with per-endpoint Cache-Control, CORS, and explicit
+	  deny rules for players.yaml / *.conf / *.log.
 
 2026-04-18  Daigo Moriwaki <101983+daigo@users.noreply.github.com>
 
