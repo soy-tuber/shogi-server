@@ -467,9 +467,16 @@ def main
   server = WEBrick::GenericServer.new(config)
   ["INT", "TERM"].each do |signal|
     trap(signal) do
-      $players.each {|p| p.kill}
-      server.shutdown
-      setup_floodgate.kill
+      # Trap context forbids Mutex operations and concurrent iteration over
+      # $players is unsafe. Defer the actual work to a fresh thread.
+      Thread.new do
+        log_message("Shutdown signal received, terminating...")
+        setup_floodgate.kill if setup_floodgate
+        $mutex.synchronize do
+          $players.to_a.each {|p| p.kill}
+        end
+        server.shutdown
+      end
     end
   end
   unless (RUBY_PLATFORM.downcase =~ /mswin|mingw|cygwin|bccwin/)
