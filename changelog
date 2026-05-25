@@ -1,3 +1,13 @@
+2026-05-25  soy-tuber <q07025a@gmail.com>
+
+	* [branch] vps-minimal: engine-only fork variant. Drops viewer
+	  components for deployment behind a CDN-hosted spectator UI
+	  that reads .csa files directly. Files removed:
+	    - webserver (WEBrick HTTP proxy serving /list and /who)
+	    - showgame/ (Ramaze visualization app)
+	    - mk_html (HTML report generator)
+	* [Makefile] Drop mk_html from the rdoc doc target.
+
 2026-04-18  Daigo Moriwaki <101983+daigo@users.noreply.github.com>
 
 	* [test] Run each test file in its own Ruby interpreter.
