@@ -40,6 +40,16 @@
 	  for serving manifest.json, ranking.json, and CSA records behind
 	  Cloudflare, with per-endpoint Cache-Control, CORS, and explicit
 	  deny rules for players.yaml / *.conf / *.log.
+	* [mk_admin_html] New top-level script. Generates a single-page
+	  read-only admin HTML aggregating manifest.json, ranking.json,
+	  and the tail of game.log (with ERROR/WARN/FATAL lines colored).
+	  Intended to be run by cron every minute and served behind
+	  Cloudflare Access so only operators can reach it. No actions,
+	  no forms, no cookies. Atomic write via tmp + rename.
+	* [sample/nginx.conf.sample] Add /admin.html location with
+	  Cache-Control: no-store and a comment block reminding operators
+	  to gate it with Cloudflare Access — nginx itself does not
+	  authenticate.
 
 2026-04-18  Daigo Moriwaki <101983+daigo@users.noreply.github.com>
 

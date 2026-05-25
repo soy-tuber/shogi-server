@@ -118,6 +118,25 @@ server {
     }
 
     # ------------------------------------------------------------------
+    # /admin.html — operator read-only dashboard. Regenerated every
+    # minute by cron running ./mk_admin_html.
+    #
+    # IMPORTANT: this endpoint is unauthenticated at the nginx layer.
+    # Protect it with Cloudflare Access (Zero Trust → Access → Apps,
+    # self-hosted, path = /admin.html, policy = "Emails ending in
+    # @your-domain") or an equivalent IdP gateway. Without that, this
+    # path is world-readable.
+    # ------------------------------------------------------------------
+    location = /admin.html {
+        default_type text/html;
+        charset utf-8;
+        add_header Cache-Control "no-store" always;
+        # No CORS header — the admin page is consumed by a browser
+        # directly, not fetched cross-origin.
+        try_files $uri =404;
+    }
+
+    # ------------------------------------------------------------------
     # /csa/YYYY/MM/DD/<game_id>.csa — game records.
     #
     # Path pattern enforced via regex so attackers can't browse the

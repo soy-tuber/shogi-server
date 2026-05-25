@@ -1,0 +1,233 @@
+#! /usr/bin/ruby
+## Copyright (C) 2026 soy-tuber
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+
+## Generate a single-page admin HTML summarizing the live state of the
+## shogi-server VPS. Read-only — no actions, no forms, no cookies.
+## Intended to be served behind Cloudflare Access (or equivalent) so
+## that only operators can reach it.
+##
+## Input sources (all optional; missing ones render as empty sections):
+##   --manifest FILE   manifest.json written by shogi-server
+##   --ranking  FILE   ranking.json written by mk_ranking_json
+##   --log      FILE   server log file (e.g. game.log)
+##   --log-lines N     number of trailing log lines to include (default 80)
+##   --output   FILE   path to HTML output (default: stdout)
+##
+## Cron example (every minute):
+##   * * * * * cd /var/lib/shogi-server && \
+##             ./mk_admin_html --manifest /var/www/floodgate/manifest.json \
+##                             --ranking  /var/www/floodgate/ranking.json \
+##                             --log      /var/log/shogi-server/game.log \
+##                             --output   /var/www/admin/admin.html
+
+require 'cgi'
+require 'getoptlong'
+require 'json'
+require 'time'
+
+LOG_LEVEL_PATTERN = /\[(ERROR|FATAL|WARN)\]/
+
+def usage
+  $stderr.puts <<-EOF
+USAGE: #{File.basename($0)} [OPTIONS]
+  --manifest FILE   manifest.json path
+  --ranking  FILE   ranking.json path
+  --log      FILE   server log file
+  --log-lines N     trailing log lines to include (default 80)
+  --output   FILE   HTML output (default: stdout)
+EOF
+end
+
+def parse_options
+  options = {"log-lines" => 80}
+  parser = GetoptLong.new(
+    ["--manifest",  GetoptLong::REQUIRED_ARGUMENT],
+    ["--ranking",   GetoptLong::REQUIRED_ARGUMENT],
+    ["--log",       GetoptLong::REQUIRED_ARGUMENT],
+    ["--log-lines", GetoptLong::REQUIRED_ARGUMENT],
+    ["--output",    GetoptLong::REQUIRED_ARGUMENT])
+  parser.quiet = true
+  parser.each_option do |name, arg|
+    options[name.sub(/^--/, "")] = arg.dup
+  end
+  options["log-lines"] = options["log-lines"].to_i
+  options["log-lines"] = 80 if options["log-lines"] <= 0
+  options
+end
+
+# Best-effort JSON load. Returns nil if the file does not exist or is
+# unparseable; the caller renders an empty section in that case so a
+# transient writer hiccup does not blank out the whole page.
+#
+def safe_load_json(path)
+  return nil unless path && File.exist?(path)
+  JSON.parse(File.read(path))
+rescue JSON::ParserError, Errno::ENOENT
+  nil
+end
+
+# Read up to `n` trailing lines from a log file without loading the
+# whole file. Files we care about are bounded by logrotate, but this
+# stays cheap even if they aren't.
+#
+def tail(path, n)
+  return [] unless path && File.exist?(path)
+  lines = []
+  File.open(path, "r") do |f|
+    block_size = 4096
+    f.seek(0, IO::SEEK_END)
+    pos = f.pos
+    buf = String.new
+    while pos > 0 && lines.size <= n + 1
+      read_size = pos < block_size ? pos : block_size
+      pos -= read_size
+      f.seek(pos)
+      buf = f.read(read_size) + buf
+      lines = buf.split("\n")
+    end
+  end
+  lines.last(n)
+end
+
+def h(text)
+  CGI.escapeHTML(text.to_s)
+end
+
+def render_active_games(manifest)
+  active = (manifest && manifest["active_games"]) || []
+  rows = active.map do |g|
+    "<tr><td class=mono>#{h g["id"]}</td>" \
+    "<td>#{h g["game_name"]}</td>" \
+    "<td>#{h g["sente"]}</td>" \
+    "<td>#{h g["gote"]}</td>" \
+    "<td class=num>#{h g["move_count"]}</td></tr>"
+  end.join("\n")
+  generated = manifest && manifest["generated_at"]
+  meta = generated ? "<p class=meta>manifest generated at #{h generated}</p>" : "<p class=meta>no manifest.json found</p>"
+  <<~HTML
+    <section>
+      <h2>Active games (#{active.size})</h2>
+      #{meta}
+      <table>
+        <thead><tr><th>id</th><th>game</th><th>sente</th><th>gote</th><th>moves</th></tr></thead>
+        <tbody>
+        #{rows.empty? ? "<tr><td colspan=5 class=empty>no active games</td></tr>" : rows}
+        </tbody>
+      </table>
+    </section>
+  HTML
+end
+
+def render_ranking(ranking, limit = 30)
+  players = (ranking && ranking["players"]) || []
+  top = players.first(limit)
+  rows = top.each_with_index.map do |p, i|
+    "<tr><td class=num>#{i + 1}</td>" \
+    "<td>#{h p["name"]}</td>" \
+    "<td class=num>#{h p["rate"]}</td>" \
+    "<td class=num>#{h p["win"]}</td>" \
+    "<td class=num>#{h p["loss"]}</td>" \
+    "<td>#{h p["group"]}</td></tr>"
+  end.join("\n")
+  generated = ranking && ranking["generated_at"]
+  meta = generated ? "<p class=meta>ranking generated at #{h generated} · top #{top.size} of #{players.size}</p>" : "<p class=meta>no ranking.json found</p>"
+  <<~HTML
+    <section>
+      <h2>Ranking</h2>
+      #{meta}
+      <table>
+        <thead><tr><th>#</th><th>name</th><th>rate</th><th>win</th><th>loss</th><th>group</th></tr></thead>
+        <tbody>
+        #{rows.empty? ? "<tr><td colspan=6 class=empty>no ranking data</td></tr>" : rows}
+        </tbody>
+      </table>
+    </section>
+  HTML
+end
+
+def render_log(log_path, lines)
+  if log_path.nil? || !File.exist?(log_path)
+    return "<section><h2>Recent log</h2><p class=meta>no log file</p></section>"
+  end
+  body = tail(log_path, lines).map do |line|
+    cls = line =~ LOG_LEVEL_PATTERN ? "log-#{$1.downcase}" : ""
+    cls.empty? ? h(line) : "<span class=\"#{cls}\">#{h line}</span>"
+  end.join("\n")
+  <<~HTML
+    <section>
+      <h2>Recent log (last #{lines} lines of #{h File.basename(log_path)})</h2>
+      <pre>#{body}</pre>
+    </section>
+  HTML
+end
+
+CSS = <<~CSS
+  :root { color-scheme: dark light; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 1100px; margin: 1.5rem auto; padding: 0 1rem;
+         background: #1a1a1a; color: #ddd; }
+  h1 { border-bottom: 2px solid #555; padding-bottom: .3rem; }
+  h2 { margin-top: 2rem; color: #6cf; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #444; padding: .25rem .5rem; text-align: left; }
+  th { background: #2a2a2a; }
+  tr:nth-child(even) td { background: #222; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .8rem; }
+  .num { text-align: right; }
+  .empty { color: #888; font-style: italic; text-align: center; }
+  .meta { color: #888; font-size: .8rem; margin: .3rem 0 .6rem; }
+  pre { background: #111; border: 1px solid #444; padding: .6rem;
+        overflow-x: auto; font-size: .8rem; line-height: 1.35;
+        max-height: 30rem; }
+  .log-error, .log-fatal { color: #f88; font-weight: bold; }
+  .log-warn  { color: #fc6; }
+  footer { margin-top: 2rem; color: #666; font-size: .75rem; }
+CSS
+
+def render_page(manifest, ranking, log_path, log_lines)
+  generated = Time.now.iso8601
+  <<~HTML
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="30">
+    <title>Floodgate Admin</title>
+    <style>#{CSS}</style>
+    </head>
+    <body>
+    <h1>Floodgate Admin</h1>
+    <p class=meta>page generated at #{h generated} · auto-refresh 30s</p>
+    #{render_active_games(manifest)}
+    #{render_ranking(ranking)}
+    #{render_log(log_path, log_lines)}
+    <footer>read-only view. To stop the server gracefully, create a STOP file in the working directory.</footer>
+    </body>
+    </html>
+  HTML
+end
+
+def main
+  options = parse_options
+  manifest = safe_load_json(options["manifest"])
+  ranking  = safe_load_json(options["ranking"])
+  html = render_page(manifest, ranking, options["log"], options["log-lines"])
+
+  if options["output"]
+    out = options["output"]
+    tmp = "#{out}.#{Process.pid}.tmp"
+    File.open(tmp, "w") {|f| f.write(html) }
+    File.rename(tmp, out)
+  else
+    print html
+  end
+end
+
+if $0 == __FILE__
+  main
+end
