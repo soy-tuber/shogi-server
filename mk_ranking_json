@@ -1,0 +1,106 @@
+#! /usr/bin/ruby
+## Copyright (C) 2026 soy-tuber
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+
+## Read players.yaml and emit a JSON ranking, sorted by rate descending.
+## Intended to be run periodically (cron, e.g. hourly) and served as a
+## static file from nginx behind a CDN so the spectator UI can render
+## the ranking without hitting the CSA server.
+##
+## Usage:
+##   mk_ranking_json --players players.yaml --output ranking.json [--limit N]
+##
+## Cron example (hourly):
+##   0 * * * * cd /var/lib/shogi-server && \
+##             ./mk_ranking_json --players players.yaml \
+##                               --output /var/www/floodgate/ranking.json
+
+require 'getoptlong'
+require 'json'
+require 'time'
+require 'yaml'
+
+def usage
+  $stderr.puts <<-EOF
+USAGE: #{File.basename($0)} [OPTIONS]
+  --players FILE   path to players.yaml (required)
+  --output FILE    path to JSON output (default: stdout)
+  --limit N        keep only the top N rated players (default: all)
+EOF
+end
+
+def parse_options
+  options = {}
+  parser = GetoptLong.new(
+    ["--players", GetoptLong::REQUIRED_ARGUMENT],
+    ["--output",  GetoptLong::REQUIRED_ARGUMENT],
+    ["--limit",   GetoptLong::REQUIRED_ARGUMENT])
+  parser.quiet = true
+  parser.each_option do |name, arg|
+    options[name.sub(/^--/, "")] = arg.dup
+  end
+  unless options["players"]
+    usage
+    exit 2
+  end
+  options["limit"] = options["limit"].to_i if options["limit"]
+  options
+end
+
+# Read players.yaml. The shogi-server uses Time objects, which Psych 4
+# rejects by default; use unsafe_load to allow them.
+#
+def load_players(yaml_path)
+  raw = File.read(yaml_path)
+  data = YAML.unsafe_load(raw) || {}
+  groups = data["players"] || {}
+  players = []
+  groups.each do |group, players_hash|
+    next unless players_hash.is_a?(Hash)
+    players_hash.each do |player_id, attrs|
+      next unless attrs.is_a?(Hash)
+      players << {
+        "name"          => attrs["name"],
+        "rate"          => (attrs["rate"] || 0).to_i,
+        "win"           => (attrs["win"] || 0).to_i,
+        "loss"          => (attrs["loss"] || 0).to_i,
+        "group"         => attrs["rating_group"] || group,
+        "last_modified" => attrs["last_modified"].respond_to?(:iso8601) ?
+                             attrs["last_modified"].iso8601 : nil
+      }
+    end
+  end
+  players
+end
+
+def main
+  options = parse_options
+  players = load_players(options["players"])
+  players.sort! {|a, b| b["rate"] <=> a["rate"]}
+  players = players.first(options["limit"]) if options["limit"]
+
+  payload = {
+    "generated_at" => Time.now.iso8601,
+    "players"      => players
+  }
+  json = JSON.generate(payload)
+
+  if options["output"]
+    # Atomic write: write to a tmp file in the same dir, then rename.
+    # nginx never sees a half-written file.
+    out = options["output"]
+    tmp = "#{out}.#{Process.pid}.tmp"
+    File.open(tmp, "w") {|f| f.write(json) }
+    File.rename(tmp, out)
+  else
+    puts json
+  end
+end
+
+if $0 == __FILE__
+  main
+end

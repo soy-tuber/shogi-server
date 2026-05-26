@@ -1,3 +1,56 @@
+2026-05-25  soy-tuber <q07025a@gmail.com>
+
+	* [branch] vps-minimal: engine-only fork variant. Drops viewer
+	  components for deployment behind a CDN-hosted spectator UI
+	  that reads .csa files directly. Files removed:
+	    - webserver (WEBrick HTTP proxy serving /list and /who)
+	    - showgame/ (Ramaze visualization app)
+	    - mk_html (HTML report generator)
+	* [Makefile] Drop mk_html from the rdoc doc target.
+	* [shogi-server] Defer shutdown work out of trap context. Calling
+	  $players.each from a signal handler races against accept-time
+	  add/delete, and Mutex operations are forbidden in trap context
+	  in Ruby 3.x. The signal handler now spawns a worker thread that
+	  takes $mutex, kills players, and calls server.shutdown.
+	* [player] Replace Thread::kill with socket close in Player#kill.
+	  Thread::kill aborts threads without running ensure blocks, so a
+	  player killed mid-command could leave $mutex (the giant lock)
+	  held, deadlocking the whole server. Closing the socket unblocks
+	  the run loop's select/gets_safe; the loop reacquires $mutex,
+	  observes @status == "finished", and exits cleanly.
+	* [shogi-server] Add --manifest-file and --manifest-interval options.
+	  When --manifest-file is given, a writer thread periodically (every
+	  --manifest-interval seconds, default 3) writes a JSON snapshot of
+	  $league.games to that path. Intended to be served by nginx behind
+	  a CDN so spectators can discover in-progress games without
+	  connecting to the CSA server, replacing the deleted webserver
+	  script's role.
+	* [manifest_writer] New class. Holds $mutex only long enough to copy
+	  primitive attributes out of $league.games; JSON serialization and
+	  the file write happen outside the lock. The file is replaced
+	  atomically via rename, so a reader (nginx) never sees a partial
+	  file. Stops via a @stopped flag rather than Thread::kill.
+	* [mk_ranking_json] New top-level script. Reads players.yaml and
+	  emits a JSON ranking sorted by rate descending. Intended to run
+	  hourly via cron and be served as a static file from nginx, so the
+	  spectator UI can render the ranking without hitting the CSA
+	  server. Replaces the ranking output that the deleted mk_html used
+	  to produce.
+	* [sample/nginx.conf.sample] New file. Documents the nginx config
+	  for serving manifest.json, ranking.json, and CSA records behind
+	  Cloudflare, with per-endpoint Cache-Control, CORS, and explicit
+	  deny rules for players.yaml / *.conf / *.log.
+	* [mk_admin_html] New top-level script. Generates a single-page
+	  read-only admin HTML aggregating manifest.json, ranking.json,
+	  and the tail of game.log (with ERROR/WARN/FATAL lines colored).
+	  Intended to be run by cron every minute and served behind
+	  Cloudflare Access so only operators can reach it. No actions,
+	  no forms, no cookies. Atomic write via tmp + rename.
+	* [sample/nginx.conf.sample] Add /admin.html location with
+	  Cache-Control: no-store and a comment block reminding operators
+	  to gate it with Cloudflare Access — nginx itself does not
+	  authenticate.
+
 2026-04-18  Daigo Moriwaki <101983+daigo@users.noreply.github.com>
 
 	* [test] Run each test file in its own Ruby interpreter.

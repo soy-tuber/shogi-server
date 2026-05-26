@@ -33,6 +33,7 @@ require_relative 'shogi_server'
 require_relative 'shogi_server/config'
 require_relative 'shogi_server/util'
 require_relative 'shogi_server/league/floodgate_thread'
+require_relative 'shogi_server/manifest_writer'
 require 'pathname'
 require 'set'
 require 'tempfile'
@@ -98,6 +99,13 @@ OPTIONS
         --player-log-dir dir
                 enable to log network messages for players. Log files
                 will be put in the dir.
+        --manifest-file file
+                periodically write a JSON manifest of currently active games
+                to this path. Intended to be served by nginx behind a CDN so
+                spectators can discover in-progress games without connecting
+                to the CSA server.
+        --manifest-interval n
+                seconds between manifest writes (default 3).
 
 EXAMPLES
 
@@ -224,6 +232,8 @@ def parse_command_line
     ["--daemon",              GetoptLong::REQUIRED_ARGUMENT],
     ["--floodgate-games",     GetoptLong::REQUIRED_ARGUMENT],
     ["--least-time-per-move", GetoptLong::REQUIRED_ARGUMENT],
+    ["--manifest-file",       GetoptLong::REQUIRED_ARGUMENT],
+    ["--manifest-interval",   GetoptLong::REQUIRED_ARGUMENT],
     ["--max-identifier",      GetoptLong::REQUIRED_ARGUMENT],
     ["--max-moves",           GetoptLong::REQUIRED_ARGUMENT],
     ["--pid-file",            GetoptLong::REQUIRED_ARGUMENT],
@@ -270,7 +280,7 @@ def check_command_line
     end 
   end
 
-  if $options["pid-file"] 
+  if $options["pid-file"]
     $options["pid-file"] = File.expand_path($options["pid-file"], $topdir)
     path = Pathname.new($options["pid-file"])
     path.dirname().mkpath()
@@ -280,6 +290,19 @@ def check_command_line
       exit 4
     end
   end
+
+  if $options["manifest-file"]
+    $options["manifest-file"] = File.expand_path($options["manifest-file"], $topdir)
+    path = Pathname.new($options["manifest-file"])
+    path.dirname().mkpath()
+    unless is_writable_dir?(path.dirname.to_s)
+      usage
+      $stderr.puts "Can not write to the manifest file directory: %s" % [path.dirname]
+      exit 7
+    end
+  end
+  $options["manifest-interval"] ||= 3
+  $options["manifest-interval"] = $options["manifest-interval"].to_i
 
   if $options["floodgate-games"]
     names = $options["floodgate-games"].split(",")
@@ -445,6 +468,7 @@ def main
   config[:Logger]     = $logger
 
   setup_floodgate = nil
+  manifest_writer = nil
 
   config[:StartCallback] = Proc.new do
     srand
@@ -455,6 +479,13 @@ def main
     $league.setup_players_database
     setup_floodgate = ShogiServer::SetupFloodgate.new($options["floodgate-games"])
     setup_floodgate.start
+    if $options["manifest-file"]
+      manifest_writer = ShogiServer::ManifestWriter.new(
+        $options["manifest-file"], $options["manifest-interval"])
+      manifest_writer.start
+      log_message("Manifest writer started: %s (every %ds)" %
+                  [$options["manifest-file"], $options["manifest-interval"]])
+    end
   end
 
   config[:StopCallback] = Proc.new do
@@ -467,9 +498,17 @@ def main
   server = WEBrick::GenericServer.new(config)
   ["INT", "TERM"].each do |signal|
     trap(signal) do
-      $players.each {|p| p.kill}
-      server.shutdown
-      setup_floodgate.kill
+      # Trap context forbids Mutex operations and concurrent iteration over
+      # $players is unsafe. Defer the actual work to a fresh thread.
+      Thread.new do
+        log_message("Shutdown signal received, terminating...")
+        manifest_writer.stop if manifest_writer
+        setup_floodgate.kill if setup_floodgate
+        $mutex.synchronize do
+          $players.to_a.each {|p| p.kill}
+        end
+        server.shutdown
+      end
     end
   end
   unless (RUBY_PLATFORM.downcase =~ /mswin|mingw|cygwin|bccwin/)

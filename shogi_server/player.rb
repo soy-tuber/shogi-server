@@ -200,8 +200,15 @@ class Player < BasicPlayer
       @game.kill(self)
     end
     finish
-    Thread::kill(@main_thread)  if @main_thread
-    Thread::kill(@write_thread) if @write_thread
+    # Close the socket instead of Thread::kill. The main thread blocked in
+    # select/gets_safe returns, the run loop reacquires $mutex, observes
+    # @status == "finished", and exits — running its ensure blocks (notably
+    # releasing $mutex). Thread::kill skipped ensure and could leak the
+    # giant lock, deadlocking the whole server.
+    begin
+      @socket.close if @socket && !@socket.closed?
+    rescue Exception
+    end
   end
 
   def finish
